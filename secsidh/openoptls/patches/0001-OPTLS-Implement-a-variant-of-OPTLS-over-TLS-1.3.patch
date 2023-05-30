@@ -1,0 +1,906 @@
+From 2b9f2c2818280446b7add41e2fd497d7e0756516 Mon Sep 17 00:00:00 2001
+From: Nicola Tuveri <nic.tuv@gmail.com>
+Date: Mon, 14 Jun 2021 20:15:41 +0300
+Subject: [PATCH] [OPTLS] Implement a variant of OPTLS over TLS 1.3
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+This commit implements semi-static Diffie-Hellman Key Establishment for
+TLS 1.3. The end result is basically equivalent to
+[tls-semistatic-dh][].
+
+The inspiration for these changes comes from an original set of patches
+by W. Kuhnen (supervised by P. Schwabe) and described in his [thesis][]:
+<https://github.com/dqi/openssl/tree/OPTLS-InternetDraft>.
+
+While the original work started as a series of cherry-picked commits,
+the end result is quite different (and possibly incompatible with) the
+original implementation.
+
+- The original branch was based on a pre-release version of OpenSSL
+  1.1.1. In this commit, the original patchset is adapted to OpenSSL
+  3.0, we add guards around all changes with `OPENSSL_NO_OPTLS` and
+  drop all the benchmarking hooks embedded in the library code by the
+  original branch.
+- Most of the code required major refactoring due to the differences in
+  libssl 3.0 compared to 1.1.1, and also due to the evolution of the
+  latest drafts of TLS 1.3 before the final RFC publication.
+
+*NOTE*: At the moment this works with static certificates embedding a
+        NIKE public key for the Subject. This is not a common type of
+        certificate at the moment, and it looks like
+        [Delegated Credentials for TLS][DC] will be the preferred way to
+        support this kind of handshakes.
+        This will require to add support for [DC][] to OpenSSL, which is
+        out of scope for this contribution at the moment.
+
+[original-OPTLS]: <https://mailarchive.ietf.org/arch/msg/tls/ma_T1AL5_jMarTB8Ci0vdfYCoVM/>
+[tls-semistatic-dh]: <https://datatracker.ietf.org/doc/html/draft-ietf-tls-semistatic-dh-01>
+[thesis]: <https://www.ru.nl/publish/pages/769526/thesis-final.pdf>
+[DC]: <https://datatracker.ietf.org/doc/html/draft-ietf-tls-subcerts>
+---
+ crypto/evp/p_lib.c         |  39 +++++++
+ doc/man3/EVP_PKEY_is_a.pod |  10 +-
+ include/openssl/evp.h      |   6 ++
+ ssl/s3_lib.c               |  85 +++++++++++++++
+ ssl/ssl_cert_table.h       |   7 ++
+ ssl/ssl_local.h            |  85 ++++++++++++++-
+ ssl/ssl_rsa.c              |  19 ++++
+ ssl/statem/statem_lib.c    | 207 ++++++++++++++++++++++++++++++++++++-
+ ssl/t1_lib.c               |  66 ++++++++++++
+ ssl/t1_trce.c              |   7 ++
+ ssl/tls13_enc.c            |  13 +++
+ 11 files changed, 538 insertions(+), 6 deletions(-)
+
+diff --git a/crypto/evp/p_lib.c b/crypto/evp/p_lib.c
+index 07be8884fe..a10e20b1b5 100644
+--- a/crypto/evp/p_lib.c
++++ b/crypto/evp/p_lib.c
+@@ -1098,6 +1098,45 @@ int EVP_PKEY_can_sign(const EVP_PKEY *pkey)
+     return 0;
+ }
+ 
++#ifndef OPENSSL_NO_OPTLS
++int EVP_PKEY_can_derive(const EVP_PKEY *pkey)
++{
++    if (pkey->keymgmt == NULL) {
++        switch (EVP_PKEY_get_base_id(pkey)) {
++# ifndef OPENSSL_NO_DH
++        case EVP_PKEY_DH:
++        case EVP_PKEY_DHX:
++            return 1;
++# endif
++# ifndef OPENSSL_NO_EC
++        case EVP_PKEY_X25519:
++        case EVP_PKEY_X448:
++            return 1;
++        case EVP_PKEY_EC:        /* Including SM2 */
++            return 1;
++# endif
++        default:
++            break;
++        }
++    } else {
++        const OSSL_PROVIDER *prov = EVP_KEYMGMT_get0_provider(pkey->keymgmt);
++        OSSL_LIB_CTX *libctx = ossl_provider_libctx(prov);
++        const char *supported_kex =
++            pkey->keymgmt->query_operation_name != NULL
++            ? pkey->keymgmt->query_operation_name(OSSL_OP_KEYEXCH)
++            : EVP_KEYMGMT_get0_name(pkey->keymgmt);
++        EVP_KEYEXCH *kex = NULL;
++
++        kex = EVP_KEYEXCH_fetch(libctx, supported_kex, NULL);
++        if (kex != NULL) {
++            EVP_KEYEXCH_free(kex);
++            return 1;
++        }
++    }
++    return 0;
++}
++#endif /* !defined(OPENSSL_NO_OPTLS) */
++
+ static int print_reset_indent(BIO **out, int pop_f_prefix, long saved_indent)
+ {
+     BIO_set_indent(*out, saved_indent);
+diff --git a/doc/man3/EVP_PKEY_is_a.pod b/doc/man3/EVP_PKEY_is_a.pod
+index 58c7ed7f8e..5feef63780 100644
+--- a/doc/man3/EVP_PKEY_is_a.pod
++++ b/doc/man3/EVP_PKEY_is_a.pod
+@@ -3,7 +3,7 @@
+ =head1 NAME
+ 
+ EVP_PKEY_is_a, EVP_PKEY_can_sign, EVP_PKEY_type_names_do_all,
+-EVP_PKEY_get0_type_name
++EVP_PKEY_get0_type_name, EVP_PKEY_can_derive
+ - key type and capabilities functions
+ 
+ =head1 SYNOPSIS
+@@ -12,6 +12,7 @@ EVP_PKEY_get0_type_name
+ 
+  int EVP_PKEY_is_a(const EVP_PKEY *pkey, const char *name);
+  int EVP_PKEY_can_sign(const EVP_PKEY *pkey);
++ int EVP_PKEY_can_derive(const EVP_PKEY *pkey);
+  int EVP_PKEY_type_names_do_all(const EVP_PKEY *pkey,
+                                 void (*fn)(const char *name, void *data),
+                                 void *data);
+@@ -25,6 +26,10 @@ EVP_PKEY_can_sign() checks if the functionality for the key type of
+ I<pkey> supports signing.  No other check is done, such as whether
+ I<pkey> contains a private key.
+ 
++EVP_PKEY_can_derive() checks if the functionality for the key type of
++I<pkey> supports key exchange derive.  No other check is done, such as whether
++I<pkey> contains a private key.
++
+ EVP_PKEY_type_names_do_all() traverses all names for I<pkey>'s key type, and
+ calls I<fn> with each name and I<data>.  For example, an RSA B<EVP_PKEY> may
+ be named both C<RSA> and C<rsaEncryption>.
+@@ -46,6 +51,9 @@ otherwise 0.
+ EVP_PKEY_can_sign() returns 1 if the I<pkey> key type functionality
+ supports signing, otherwise 0.
+ 
++EVP_PKEY_can_derive() returns 1 if the I<pkey> key type functionality
++supports key exchange derive, otherwise 0.
++
+ EVP_PKEY_get0_type_name() returns the name that is found or NULL on error.
+ 
+ EVP_PKEY_type_names_do_all() returns 1 if the callback was called for all
+diff --git a/include/openssl/evp.h b/include/openssl/evp.h
+index 50cf8eeb77..258d3270c0 100644
+--- a/include/openssl/evp.h
++++ b/include/openssl/evp.h
+@@ -67,6 +67,9 @@
+ # define EVP_PKEY_DH     NID_dhKeyAgreement
+ # define EVP_PKEY_DHX    NID_dhpublicnumber
+ # define EVP_PKEY_EC     NID_X9_62_id_ecPublicKey
++# ifndef OPENSSL_NO_OPTLS
++#  define EVP_PKEY_ECX    NID_X9_62_id_ecPublicKey
++# endif
+ # define EVP_PKEY_SM2    NID_sm2
+ # define EVP_PKEY_HMAC   NID_hmac
+ # define EVP_PKEY_CMAC   NID_cmac
+@@ -1314,6 +1317,9 @@ int EVP_PKEY_get_security_bits(const EVP_PKEY *pkey);
+ int EVP_PKEY_get_size(const EVP_PKEY *pkey);
+ # define EVP_PKEY_size EVP_PKEY_get_size
+ int EVP_PKEY_can_sign(const EVP_PKEY *pkey);
++# ifndef OPENSSL_NO_OPTLS
++int EVP_PKEY_can_derive(const EVP_PKEY *pkey);
++# endif
+ int EVP_PKEY_set_type(EVP_PKEY *pkey, int type);
+ int EVP_PKEY_set_type_str(EVP_PKEY *pkey, const char *str, int len);
+ int EVP_PKEY_set_type_by_keymgmt(EVP_PKEY *pkey, EVP_KEYMGMT *keymgmt);
+diff --git a/ssl/s3_lib.c b/ssl/s3_lib.c
+index 348d02d8bd..5bcdd4d968 100644
+--- a/ssl/s3_lib.c
++++ b/ssl/s3_lib.c
+@@ -4737,6 +4737,75 @@ EVP_PKEY *ssl_generate_param_group(SSL *s, uint16_t id)
+     return pkey;
+ }
+ 
++# ifndef OPENSSL_NO_OPTLS
++static
++int tls13_generate_static_secret(SSL *s, EVP_PKEY *pubkey)
++{
++    int rv = 0;
++    unsigned char *ss = NULL;
++    size_t sslen = 0;
++    EVP_PKEY_CTX *gsctx = NULL;
++    EVP_PKEY *server_static_secret = NULL;
++
++    /*
++     * This function should be reached only if
++     *
++     * - we are in TLS 1.3, AND
++     * - we are the server, AND
++     * - not resuming, AND
++     * - doing DHauth
++     *
++     */
++    OPENSSL_assert(SSL_IS_TLS13(s)
++            && s->server
++            && !s->hit
++            && optls_sigidx_is_NIKE(s->s3.tmp.sigalg->sig_idx));
++
++    server_static_secret = s->s3.tmp.cert->privatekey;
++    if (server_static_secret == NULL || pubkey == NULL) {
++        SSLfatal(s, SSL_AD_INTERNAL_ERROR, ERR_R_INTERNAL_ERROR);
++        return 0;
++    }
++    gsctx = EVP_PKEY_CTX_new(server_static_secret, NULL);
++    if (gsctx == NULL) {
++        SSLfatal(s, SSL_AD_INTERNAL_ERROR, ERR_R_MALLOC_FAILURE);
++        goto err;
++    }
++
++    if (EVP_PKEY_derive_init(gsctx) <= 0
++            || EVP_PKEY_derive_set_peer(gsctx, pubkey) <= 0
++            || EVP_PKEY_derive(gsctx, NULL, &sslen) <= 0) {
++        SSLfatal(s, SSL_AD_INTERNAL_ERROR, ERR_R_INTERNAL_ERROR);
++        goto err;
++    }
++
++    ss = OPENSSL_malloc(sslen);
++    if (ss == NULL) {
++        SSLfatal(s, SSL_AD_INTERNAL_ERROR, ERR_R_MALLOC_FAILURE);
++        goto err;
++    }
++
++    if (EVP_PKEY_derive(gsctx, ss, &sslen) <= 0) {
++        SSLfatal(s, SSL_AD_INTERNAL_ERROR, ERR_R_INTERNAL_ERROR);
++        goto err;
++    }
++
++    /* Save static secret */
++    s->s3.tmp.ss = ss;
++    s->s3.tmp.sslen = sslen;
++    ss = NULL;
++
++    rv = 1;
++
++err:
++    OPENSSL_clear_free(ss, sslen);
++    EVP_PKEY_CTX_free(gsctx);
++
++    return rv;
++}
++
++# endif /* !defined(OPENSSL_NO_OPTLS) */
++
+ /* Generate secrets from pms */
+ int ssl_gensecret(SSL *s, unsigned char *pms, size_t pmslen)
+ {
+@@ -4801,6 +4870,22 @@ int ssl_derive(SSL *s, EVP_PKEY *privkey, EVP_PKEY *pubkey, int gensecret)
+ 
+     if (gensecret) {
+         /* SSLfatal() called as appropriate in the below functions */
++
++# ifndef OPENSSL_NO_OPTLS
++        /*
++         * If TLS 1.3 AND we are the server AND not resuming AND doing DHauth,
++         * THEN we need to generate the static secret
++         */
++        if (SSL_IS_TLS13(s)
++                && s->server
++                && !s->hit
++                && optls_sigidx_is_NIKE(s->s3.tmp.sigalg->sig_idx)) {
++            rv = tls13_generate_static_secret(s, pubkey);
++            if (!rv)
++                goto err;
++        }
++# endif
++
+         rv = ssl_gensecret(s, pms, pmslen);
+     } else {
+         /* Save premaster secret */
+diff --git a/ssl/ssl_cert_table.h b/ssl/ssl_cert_table.h
+index f66c5fe390..b7a36d7dc7 100644
+--- a/ssl/ssl_cert_table.h
++++ b/ssl/ssl_cert_table.h
+@@ -19,5 +19,12 @@ static const SSL_CERT_LOOKUP ssl_cert_info [] = {
+     {NID_id_GostR3410_2012_256, SSL_aGOST12}, /* SSL_PKEY_GOST12_256 */
+     {NID_id_GostR3410_2012_512, SSL_aGOST12}, /* SSL_PKEY_GOST12_512 */
+     {EVP_PKEY_ED25519, SSL_aECDSA}, /* SSL_PKEY_ED25519 */
++#ifndef OPENSSL_NO_OPTLS
++    {EVP_PKEY_ED448, SSL_aECDSA}, /* SSL_PKEY_ED448 */
++    {EVP_PKEY_X25519, SSL_aDH}, /* SSL_PKEY_ED25519 */
++    {EVP_PKEY_X448, SSL_aDH}, /* SSL_PKEY_ED448 */
++    {EVP_PKEY_ECX, SSL_aDH} /* SSL_PKEY_ED448 */
++#else
+     {EVP_PKEY_ED448, SSL_aECDSA} /* SSL_PKEY_ED448 */
++#endif /* !defined(OPENSSL_NO_OPTLS) */
+ };
+diff --git a/ssl/ssl_local.h b/ssl/ssl_local.h
+index def53739a1..b1f0822dad 100644
+--- a/ssl/ssl_local.h
++++ b/ssl/ssl_local.h
+@@ -207,6 +207,10 @@
+ # define SSL_aSRP                0x00000040U
+ /* GOST R 34.10-2012 signature auth */
+ # define SSL_aGOST12             0x00000080U
++# ifndef OPENSSL_NO_OPTLS
++/* DH Certificates auth */
++#  define SSL_aDH                 0x00000100U
++# endif
+ /* Any appropriate signature auth (for TLS 1.3 ciphersuites) */
+ # define SSL_aANY                0x00000000U
+ /* All bits requiring a certificate */
+@@ -405,7 +409,20 @@
+ # define SSL_PKEY_GOST12_512     6
+ # define SSL_PKEY_ED25519        7
+ # define SSL_PKEY_ED448          8
+-# define SSL_PKEY_NUM            9
++# ifdef OPENSSL_NO_OPTLS
++#  define SSL_PKEY_NUM            9
++# else
++#  define SSL_PKEY_NIKE_CERT_START  9
++#  define SSL_PKEY_X25519         9
++#  define SSL_PKEY_X448           10
++#  define SSL_PKEY_ECCX           11
++#  define SSL_PKEY_NUM            12
++/*
++ * Pseudo-constant. GOST cipher suites can use different certs for 1
++ * SSL_CIPHER. So let's see which one we have in fact.
++ */
++#  define SSL_PKEY_GOST_EC SSL_PKEY_NUM+1
++# endif /* defined(OPENSSL_NO_OPTLS) */
+ 
+ # define SSL_ENC_DES_IDX         0
+ # define SSL_ENC_3DES_IDX        1
+@@ -1330,6 +1347,11 @@ struct ssl_st {
+             /* Raw values of the cipher list from a client */
+             unsigned char *ciphers_raw;
+             size_t ciphers_rawlen;
++# ifndef OPENSSL_NO_OPTLS
++            /* Temporary storage for static secret */
++            unsigned char *ss;
++            size_t sslen;
++# endif
+             /* Temporary storage for premaster secret */
+             unsigned char *pms;
+             size_t pmslen;
+@@ -1452,6 +1474,9 @@ struct ssl_st {
+     /*
+      * The TLS1.3 secrets.
+      */
++#ifndef OPENSSL_NO_OPTLS
++    unsigned char ss_base_key[EVP_MAX_MD_SIZE];
++#endif
+     unsigned char early_secret[EVP_MAX_MD_SIZE];
+     unsigned char handshake_secret[EVP_MAX_MD_SIZE];
+     unsigned char master_secret[EVP_MAX_MD_SIZE];
+@@ -2148,6 +2173,14 @@ typedef enum downgrade_en {
+ #define TLSEXT_STATUSTYPE_nothing  -1
+ 
+ /* Sigalgs values */
++#ifndef OPENSSL_NO_OPTLS
++# define TLSEXT_SIGALG_p256                                      0x0901
++# define TLSEXT_SIGALG_p384                                      0x0902
++# define TLSEXT_SIGALG_p521                                      0x0903
++# define TLSEXT_SIGALG_X25519                                    0x0904
++# define TLSEXT_SIGALG_X448                                      0x0905
++#endif
++
+ #define TLSEXT_SIGALG_ecdsa_secp256r1_sha256                    0x0403
+ #define TLSEXT_SIGALG_ecdsa_secp384r1_sha384                    0x0503
+ #define TLSEXT_SIGALG_ecdsa_secp521r1_sha512                    0x0603
+@@ -2375,6 +2408,56 @@ static ossl_inline void tls1_get_peer_groups(SSL *s, const uint16_t **pgroups,
+     *pgroupslen = s->ext.peer_supportedgroups_len;
+ }
+ 
++# ifndef OPENSSL_NO_OPTLS
++static ossl_inline
++int optls_sigidx_is_NIKE(int sigidx)
++{
++    return sigidx >= SSL_PKEY_NIKE_CERT_START;
++}
++
++static ossl_inline
++int optls_cert_supports_optls(const X509 *cert)
++{
++    OPENSSL_assert(cert != NULL);
++    return X509_get_key_usage((X509*)cert) & KU_KEY_AGREEMENT;
++}
++
++static ossl_inline
++int optls_pkey_supports_optls(const EVP_PKEY *pkey)
++{
++    OPENSSL_assert(pkey != NULL);
++    return EVP_PKEY_can_derive(pkey);
++}
++
++static ossl_inline
++int optls_ssl_is_optls(const SSL *s)
++{
++    const SIGALG_LOOKUP *sigalg = NULL;
++
++    OPENSSL_assert(s != NULL);
++
++    if (!SSL_IS_TLS13(s))
++        return 0;
++
++    sigalg = s->server ? s->s3.tmp.sigalg : s->s3.tmp.peer_sigalg;
++    OPENSSL_assert(sigalg != NULL);
++    if (!optls_sigidx_is_NIKE(sigalg->sig_idx))
++        return 0;
++
++    if (s->server) {
++        OPENSSL_assert(s->s3.tmp.cert != NULL);
++        return optls_cert_supports_optls(s->s3.tmp.cert->x509)
++            && optls_pkey_supports_optls(s->s3.tmp.cert->privatekey);
++    } else {
++        OPENSSL_assert(s->session != NULL);
++        const X509* peer = s->session->peer;
++        OPENSSL_assert(peer != NULL);
++        return optls_cert_supports_optls(peer)
++            && optls_pkey_supports_optls(X509_get0_pubkey(peer));
++    }
++}
++# endif /* !defined(OPENSSL_NO_OPTLS) */
++
+ # ifndef OPENSSL_UNIT_TEST
+ 
+ __owur int ssl_read_internal(SSL *s, void *buf, size_t num, size_t *readbytes);
+diff --git a/ssl/ssl_rsa.c b/ssl/ssl_rsa.c
+index cf410d6d87..eb976b7c62 100644
+--- a/ssl/ssl_rsa.c
++++ b/ssl/ssl_rsa.c
+@@ -132,6 +132,14 @@ static int ssl_set_pkey(CERT *c, EVP_PKEY *pkey)
+     EVP_PKEY_up_ref(pkey);
+     c->pkeys[i].privatekey = pkey;
+     c->key = &c->pkeys[i];
++
++#ifndef OPENSSL_NO_OPTLS
++    if (i == SSL_PKEY_ECC) {
++        c->pkeys[SSL_PKEY_ECCX].privatekey = pkey;
++        c->key = &c->pkeys[SSL_PKEY_ECCX];
++    }
++#endif
++
+     return 1;
+ }
+ 
+@@ -241,8 +249,12 @@ static int ssl_set_cert(CERT *c, X509 *x)
+     }
+ 
+     if (i == SSL_PKEY_ECC && !EVP_PKEY_can_sign(pkey)) {
++# ifndef OPENSSL_NO_OPTLS
++        i = SSL_PKEY_ECCX;
++# else
+         ERR_raise(ERR_LIB_SSL, SSL_R_ECC_CERT_NOT_FOR_SIGNING);
+         return 0;
++# endif
+     }
+ 
+     if (c->pkeys[i].privatekey != NULL) {
+@@ -271,6 +283,13 @@ static int ssl_set_cert(CERT *c, X509 *x)
+     c->pkeys[i].x509 = x;
+     c->key = &(c->pkeys[i]);
+ 
++#ifndef OPENSSL_NO_OPTLS
++    if (i == SSL_PKEY_ECC) {
++        c->pkeys[SSL_PKEY_ECCX].x509 = x;
++        c->key = &(c->pkeys[SSL_PKEY_ECCX]);
++    }
++#endif
++
+     return 1;
+ }
+ 
+diff --git a/ssl/statem/statem_lib.c b/ssl/statem/statem_lib.c
+index eef2fe4367..d6b59d3825 100644
+--- a/ssl/statem/statem_lib.c
++++ b/ssl/statem/statem_lib.c
+@@ -269,8 +269,114 @@ static int get_cert_verify_tbs_data(SSL *s, unsigned char *tls13tbs,
+     return 1;
+ }
+ 
++# ifndef OPENSSL_NO_OPTLS
++static ossl_inline
++int optls_clnt_derive_static_secret(SSL *s)
++{
++    int ok = 0;
++    EVP_PKEY_CTX *pctx = NULL;
++    unsigned char *ss = NULL;
++    size_t sslen = 0;
++    EVP_PKEY *privkey = NULL, *pubkey = NULL;
++    X509 *peer = NULL;
++
++    OPENSSL_assert(s != NULL
++            && !s->server
++            && s->session != NULL
++            && s->session->peer != NULL);
++
++    privkey = s->s3.tmp.pkey;
++    peer = s->session->peer;
++    pubkey = X509_get0_pubkey(peer);
++
++    if (privkey == NULL || pubkey == NULL) {
++        SSLfatal(s, SSL_AD_INTERNAL_ERROR, ERR_R_INTERNAL_ERROR);
++        goto err;
++    }
++
++    /* Derive static secret */
++    pctx = EVP_PKEY_CTX_new(privkey, NULL);
++    if (pctx == NULL) {
++        SSLfatal(s, SSL_AD_INTERNAL_ERROR, ERR_R_MALLOC_FAILURE);
++        goto err;
++    }
++    if (EVP_PKEY_derive_init(pctx) <= 0
++            || EVP_PKEY_derive_set_peer(pctx, pubkey) <= 0
++            || EVP_PKEY_derive(pctx, NULL, &sslen) <= 0) {
++        SSLfatal(s, SSL_AD_INTERNAL_ERROR, ERR_R_EVP_LIB);
++        goto err;
++    }
++
++    /* Allocate buffer for static secret */
++    ss = OPENSSL_malloc(sslen);
++    if (ss == NULL) {
++        SSLfatal(s, SSL_AD_INTERNAL_ERROR, ERR_R_MALLOC_FAILURE);
++        goto err;
++    }
++
++    /* Derive static secret */
++    if (EVP_PKEY_derive(pctx, ss, &sslen) <= 0) {
++        SSLfatal(s, SSL_AD_INTERNAL_ERROR, ERR_R_INTERNAL_ERROR);
++        goto err;
++    }
++
++    /* Save static secret */
++    s->s3.tmp.ss = ss;
++    s->s3.tmp.sslen = sslen;
++    ss = NULL;
++    ok = 1;
++
++err:
++    OPENSSL_clear_free(ss, sslen);
++    EVP_PKEY_CTX_free(pctx);
++    return ok;
++}
++
++static ossl_inline
++int optls_generate_MAC_key(SSL *s,
++        unsigned char *outkey, size_t outkeylen)
++{
++    int ok = 0;
++    const EVP_MD *md = NULL;
++
++    OPENSSL_assert(s != NULL
++            /*
++             * We require that the static shared secret is already saved
++             * in theSSL object.
++             */
++            && s->s3.tmp.ss != NULL
++            && s->s3.tmp.sslen > 0);
++
++    md = ssl_handshake_md(s);
++
++    /* Generate the SS-Base-Key */
++    if (!tls13_generate_secret(s, md, NULL, s->s3.tmp.ss,
++                s->s3.tmp.sslen, s->ss_base_key)) {
++        /* SSLfatal() already called */
++        goto err;
++    }
++
++    /* Generate the finished key */
++    if (!tls13_derive_finishedkey(s, md, s->ss_base_key,
++                outkey, outkeylen)) {
++        /* SSLfatal() already called */
++        goto err;
++    }
++
++    ok = 1;
++err:
++    OPENSSL_cleanse(s->ss_base_key, s->s3.tmp.sslen);
++    OPENSSL_clear_free(s->s3.tmp.ss, s->s3.tmp.sslen);
++    s->s3.tmp.ss = NULL;
++    s->s3.tmp.sslen = 0;
++    return ok;
++}
++# endif /* !defined(OPENSSL_NO_OPTLS) */
++
++
+ int tls_construct_cert_verify(SSL *s, WPACKET *pkt)
+ {
++    int ok = 0;
+     EVP_PKEY *pkey = NULL;
+     const EVP_MD *md = NULL;
+     EVP_MD_CTX *mctx = NULL;
+@@ -280,6 +386,9 @@ int tls_construct_cert_verify(SSL *s, WPACKET *pkt)
+     unsigned char *sig = NULL;
+     unsigned char tls13tbs[TLS13_TBS_PREAMBLE_SIZE + EVP_MAX_MD_SIZE];
+     const SIGALG_LOOKUP *lu = s->s3.tmp.sigalg;
++# ifndef OPENSSL_NO_OPTLS
++    unsigned char finishedkey[EVP_MAX_MD_SIZE];
++# endif
+ 
+     if (lu == NULL || s->s3.tmp.cert == NULL) {
+         SSLfatal(s, SSL_AD_INTERNAL_ERROR, ERR_R_INTERNAL_ERROR);
+@@ -309,6 +418,41 @@ int tls_construct_cert_verify(SSL *s, WPACKET *pkt)
+         goto err;
+     }
+ 
++# ifndef OPENSSL_NO_OPTLS
++    /*
++     * So we either sign with our private key or MAC with SS-Base-Key, depends
++     * on which sig_alg we selected - Server side
++     */
++    if (optls_ssl_is_optls(s)) {
++        /* We use MAC for authentication */
++        unsigned int len;
++        const EVP_MD *mac_hash = ssl_handshake_md(s);
++        size_t hashsize = EVP_MD_size(mac_hash);
++
++        /* optls_generate_MAC_key() also cleanses s->s3.tmp.ss */
++        if (!optls_generate_MAC_key(s, finishedkey, hashsize)) {
++            /* SSLfatal() already called */
++            goto err;
++        }
++
++        /* Compute the MAC */
++        sig = EVP_Q_mac(s->ctx->libctx, "HMAC",
++                NULL /*propq*/,
++                EVP_MD_get0_name(mac_hash) /*subalg*/,
++                NULL /*params*/,
++                finishedkey /*key*/, hashsize /*keylen*/,
++                hdata /*data*/, hdatalen /*datalen*/,
++                NULL /*out*/, 0 /*outsize*/, &len /*outlen*/);
++        siglen = len;
++        if (sig == NULL) {
++            SSLfatal(s, SSL_AD_INTERNAL_ERROR, ERR_R_INTERNAL_ERROR);
++            goto err;
++        }
++    } else
++# endif /* !defined(OPENSSL_NO_OPTLS) */
++    {
++    /* We use signature for authentication */
++
+     if (EVP_DigestSignInit_ex(mctx, &pctx,
+                               md == NULL ? NULL : EVP_MD_get0_name(md),
+                               s->ctx->libctx, s->ctx->propq, pkey,
+@@ -372,6 +516,7 @@ int tls_construct_cert_verify(SSL *s, WPACKET *pkt)
+             BUF_reverse(sig, NULL, siglen);
+     }
+ #endif
++    }
+ 
+     if (!WPACKET_sub_memcpy_u16(pkt, sig, siglen)) {
+         SSLfatal(s, SSL_AD_INTERNAL_ERROR, ERR_R_INTERNAL_ERROR);
+@@ -384,13 +529,14 @@ int tls_construct_cert_verify(SSL *s, WPACKET *pkt)
+         goto err;
+     }
+ 
+-    OPENSSL_free(sig);
+-    EVP_MD_CTX_free(mctx);
+-    return 1;
++    ok = 1;
+  err:
++# ifndef OPENSSL_NO_OPTLS
++    OPENSSL_cleanse(finishedkey, EVP_MAX_MD_SIZE);
++# endif
+     OPENSSL_free(sig);
+     EVP_MD_CTX_free(mctx);
+-    return 0;
++    return ok;
+ }
+ 
+ MSG_PROCESS_RETURN tls_process_cert_verify(SSL *s, PACKET *pkt)
+@@ -410,6 +556,9 @@ MSG_PROCESS_RETURN tls_process_cert_verify(SSL *s, PACKET *pkt)
+     unsigned char tls13tbs[TLS13_TBS_PREAMBLE_SIZE + EVP_MAX_MD_SIZE];
+     EVP_MD_CTX *mctx = EVP_MD_CTX_new();
+     EVP_PKEY_CTX *pctx = NULL;
++#ifndef OPENSSL_NO_OPTLS
++    unsigned char finishedkey[EVP_MAX_MD_SIZE];
++#endif
+ 
+     if (mctx == NULL) {
+         SSLfatal(s, SSL_AD_INTERNAL_ERROR, ERR_R_MALLOC_FAILURE);
+@@ -487,6 +636,52 @@ MSG_PROCESS_RETURN tls_process_cert_verify(SSL *s, PACKET *pkt)
+     OSSL_TRACE1(TLS, "Using client verify alg %s\n",
+                 md == NULL ? "n/a" : EVP_MD_get0_name(md));
+ 
++# ifndef OPENSSL_NO_OPTLS
++    if (optls_ssl_is_optls(s)) {
++        /* CertVerify has a MAC to be verified */
++        /* Derive static secret and verify MAC - Client side */
++        unsigned char computed_mac[EVP_MAX_MD_SIZE];
++        unsigned int tmplen;
++        const EVP_MD *mac_hash = ssl_handshake_md(s);
++        size_t computed_mac_len = 0, hashsize = EVP_MD_size(mac_hash);
++
++        /* optls_clnt_derive_static_secret() fills s->s3.tmp.ss */
++        if (!optls_clnt_derive_static_secret(s)) {
++            /* SSLfatal() already called */
++            goto err;
++        }
++
++        /* optls_generate_MAC_key() also cleanses s->s3.tmp.ss */
++        if (!optls_generate_MAC_key(s, finishedkey, hashsize)) {
++            /* SSLfatal() already called */
++            goto err;
++        }
++
++        /* Compute the MAC */
++        if (NULL == EVP_Q_mac(s->ctx->libctx, "HMAC",
++                    NULL /*propq*/,
++                    EVP_MD_get0_name(mac_hash) /*subalg*/,
++                    NULL /*params*/,
++                    finishedkey /*key*/, hashsize /*keylen*/,
++                    hdata /*data*/, hdatalen /*datalen*/,
++                    computed_mac /*out*/,
++                    EVP_MAX_MD_SIZE /*outsize*/,
++                    &tmplen /*outlen*/)) {
++            SSLfatal(s, SSL_AD_INTERNAL_ERROR, ERR_R_INTERNAL_ERROR);
++            goto err;
++        }
++        computed_mac_len = tmplen;
++
++        /* Verify the MAC */
++        if (CRYPTO_memcmp(data, computed_mac, computed_mac_len) != 0) {
++            SSLfatal(s, SSL_AD_DECRYPT_ERROR, SSL_R_DIGEST_CHECK_FAILED);
++            goto err;
++        }
++
++    } else
++# endif /* !defined(OPENSSL_NO_OPTLS) */
++    {
++    /* CertVerify has a signature to be verified */
+     if (EVP_DigestVerifyInit_ex(mctx, &pctx,
+                                 md == NULL ? NULL : EVP_MD_get0_name(md),
+                                 s->ctx->libctx, s->ctx->propq, pkey,
+@@ -537,6 +732,7 @@ MSG_PROCESS_RETURN tls_process_cert_verify(SSL *s, PACKET *pkt)
+             goto err;
+         }
+     }
++    }
+ 
+     /*
+      * In TLSv1.3 on the client side we make sure we prepare the client
+@@ -556,6 +752,9 @@ MSG_PROCESS_RETURN tls_process_cert_verify(SSL *s, PACKET *pkt)
+     EVP_MD_CTX_free(mctx);
+ #ifndef OPENSSL_NO_GOST
+     OPENSSL_free(gost_data);
++#endif
++#ifndef OPENSSL_NO_OPTLS
++    OPENSSL_cleanse(finishedkey, EVP_MAX_MD_SIZE);
+ #endif
+     return ret;
+ }
+diff --git a/ssl/t1_lib.c b/ssl/t1_lib.c
+index 3bc424acef..ec82c40b88 100644
+--- a/ssl/t1_lib.c
++++ b/ssl/t1_lib.c
+@@ -975,6 +975,13 @@ int tls1_check_ec_tmp_key(SSL *s, unsigned long cid)
+ 
+ /* Default sigalg schemes */
+ static const uint16_t tls12_sigalgs[] = {
++#ifndef OPENSSL_NO_OPTLS
++    TLSEXT_SIGALG_p256,
++    TLSEXT_SIGALG_p384,
++    TLSEXT_SIGALG_p521,
++    TLSEXT_SIGALG_X25519,
++    TLSEXT_SIGALG_X448,
++#endif
+     TLSEXT_SIGALG_ecdsa_secp256r1_sha256,
+     TLSEXT_SIGALG_ecdsa_secp384r1_sha384,
+     TLSEXT_SIGALG_ecdsa_secp521r1_sha512,
+@@ -1021,6 +1028,23 @@ static const uint16_t suiteb_sigalgs[] = {
+ };
+ 
+ static const SIGALG_LOOKUP sigalg_lookup_tbl[] = {
++#ifndef OPENSSL_NO_OPTLS
++    {"sig_p256", TLSEXT_SIGALG_p256,
++     NID_undef, -1, EVP_PKEY_ECX, SSL_PKEY_ECCX,
++     NID_undef, NID_X9_62_prime256v1, 1},
++    {"sig_p384", TLSEXT_SIGALG_p384,
++     NID_undef, -1, EVP_PKEY_ECX, SSL_PKEY_ECCX,
++     NID_undef, NID_secp384r1, 1},
++    {"sig_p521", TLSEXT_SIGALG_p521,
++     NID_undef, -1, EVP_PKEY_ECX, SSL_PKEY_ECCX,
++     NID_undef, NID_secp521r1, 1},
++    {"sig_x25519", TLSEXT_SIGALG_X25519,
++     NID_undef, -1, EVP_PKEY_X25519, SSL_PKEY_X25519,
++     NID_undef, NID_undef, 1},
++    {"sig_x448", TLSEXT_SIGALG_X448,
++     NID_undef, -1, EVP_PKEY_X448, SSL_PKEY_X448,
++     NID_undef, NID_undef, 1},
++#endif
+     {"ecdsa_secp256r1_sha256", TLSEXT_SIGALG_ecdsa_secp256r1_sha256,
+      NID_sha256, SSL_MD_SHA256_IDX, EVP_PKEY_EC, SSL_PKEY_ECC,
+      NID_ecdsa_with_SHA256, NID_X9_62_prime256v1, 1},
+@@ -1405,6 +1429,30 @@ int tls_check_sigalg_curve(const SSL *s, int curve)
+     return 0;
+ }
+ 
++# ifndef OPENSSL_NO_OPTLS
++/*
++ * Return the number of security bits for the signature algorithm, or 0 on
++ * error.
++ */
++static ossl_inline
++int optls_sigalg_security_bits(SSL_CTX *ctx, const SIGALG_LOOKUP *lu)
++{
++    OPENSSL_assert(ctx != NULL && lu != NULL);
++
++    // FIXME: check secbit values
++    if (lu->sigalg == TLSEXT_SIGALG_p384)
++        return 192;
++    else if (lu->sigalg == TLSEXT_SIGALG_p521)
++        return 256;
++    else if (lu->sigalg == TLSEXT_SIGALG_X448)
++        return 224;
++    else if(optls_sigidx_is_NIKE(lu->sig_idx))
++        return 128; // default
++
++    return 0;
++}
++# endif /* !defined(OPENSSL_NO_OPTLS) */
++
+ /*
+  * Return the number of security bits for the signature algorithm, or 0 on
+  * error.
+@@ -1444,6 +1492,11 @@ static int sigalg_security_bits(SSL_CTX *ctx, const SIGALG_LOOKUP *lu)
+             secbits = 128;
+         else if (lu->sigalg == TLSEXT_SIGALG_ed448)
+             secbits = 224;
++# ifndef OPENSSL_NO_OPTLS
++        if (secbits == 0) {
++            secbits = optls_sigalg_security_bits(ctx, lu);
++        }
++# endif
+     }
+     return secbits;
+ }
+@@ -1492,8 +1545,16 @@ int tls12_check_peer_sigalg(SSL *s, uint16_t sig, EVP_PKEY *pkey)
+     /* Check the sigalg is consistent with the key OID */
+     if (!ssl_cert_lookup_by_nid(EVP_PKEY_get_id(pkey), &cidx)
+             || lu->sig_idx != (int)cidx) {
++#ifdef OPENSSL_NO_OPTLS
+         SSLfatal(s, SSL_AD_ILLEGAL_PARAMETER, SSL_R_WRONG_SIGNATURE_TYPE);
+         return 0;
++#else
++        /* NIST Curves can be used for both signing and OPTLS */
++        if (lu->sig_idx != SSL_PKEY_ECCX || (int)cidx != SSL_PKEY_ECC) {
++            SSLfatal(s, SSL_AD_ILLEGAL_PARAMETER, SSL_R_WRONG_SIGNATURE_TYPE);
++            return 0;
++        }
++#endif /* defined(OPENSSL_NO_OPTLS) */
+     }
+ 
+     if (pkeyid == EVP_PKEY_EC) {
+@@ -3060,6 +3121,11 @@ static int check_cert_usable(SSL *s, const SIGALG_LOOKUP *sig, X509 *x,
+      */
+     if (sig->hash != NID_undef)
+         mdname = OBJ_nid2sn(sig->hash);
++# ifndef OPENSSL_NO_OPTLS
++    if (optls_sigidx_is_NIKE(sig->sig_idx))
++        supported = 1;
++    else
++# endif /* !defined(OPENSSL_NO_OPTLS) */
+     supported = EVP_PKEY_digestsign_supports_digest(pkey, s->ctx->libctx,
+                                                     mdname,
+                                                     s->ctx->propq);
+diff --git a/ssl/t1_trce.c b/ssl/t1_trce.c
+index 405b1e6864..75eefb8ad4 100644
+--- a/ssl/t1_trce.c
++++ b/ssl/t1_trce.c
+@@ -556,6 +556,13 @@ static const ssl_trace_tbl ssl_mfl_tbl[] = {
+ };
+ 
+ static const ssl_trace_tbl ssl_sigalg_tbl[] = {
++#ifndef OPENSSL_NO_OPTLS
++    {TLSEXT_SIGALG_p256, "sig_p256"},
++    {TLSEXT_SIGALG_p384, "sig_p384"},
++    {TLSEXT_SIGALG_p521, "sig_p521"},
++    {TLSEXT_SIGALG_X25519, "sig_x25519"},
++    {TLSEXT_SIGALG_X448, "sig_x448"},
++#endif /* !defined(OPENSSL_NO_OPTLS) */
+     {TLSEXT_SIGALG_ecdsa_secp256r1_sha256, "ecdsa_secp256r1_sha256"},
+     {TLSEXT_SIGALG_ecdsa_secp384r1_sha384, "ecdsa_secp384r1_sha384"},
+     {TLSEXT_SIGALG_ecdsa_secp521r1_sha512, "ecdsa_secp521r1_sha512"},
+diff --git a/ssl/tls13_enc.c b/ssl/tls13_enc.c
+index 11e39715d8..b3c70ef530 100644
+--- a/ssl/tls13_enc.c
++++ b/ssl/tls13_enc.c
+@@ -295,6 +295,19 @@ int tls13_generate_master_secret(SSL *s, unsigned char *out,
+ 
+     *secret_size = EVP_MD_get_size(md);
+     /* Calls SSLfatal() if required */
++#ifndef OPENSSL_NO_OPTLS
++    if (!s->hit) {
++        const SIGALG_LOOKUP *sigalg = NULL;
++
++        sigalg = s->server ? s->s3.tmp.sigalg : s->s3.tmp.peer_sigalg;
++        OPENSSL_assert(sigalg != NULL);
++
++        if (optls_sigidx_is_NIKE(sigalg->sig_idx))
++            return tls13_generate_secret(s, md, prev,
++                                         s->s3.tmp.ss, s->s3.tmp.sslen,
++                                         out);
++    }
++#endif /* !defined(OPENSSL_NO_OPTLS) */
+     return tls13_generate_secret(s, md, prev, NULL, 0, out);
+ }
+ 
+-- 
+2.31.1
+

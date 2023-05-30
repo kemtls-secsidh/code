@@ -1,0 +1,4 @@
+[submodule "xmss-reference"]
+	path = xmss-reference
+	url = https://github.com/thomwiggers/xmss-reference.git
+    branch = detached_signatures
