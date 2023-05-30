@@ -1,0 +1,15 @@
+[package]
+name = "signutil"
+version = "0.1.0"
+authors = ["Thom Wiggers <thom@thomwiggers.nl>"]
+edition = "2018"
+
+# See more keys and their definitions at https://doc.rust-lang.org/cargo/reference/manifest.html
+
+[dependencies]
+
+[dependencies.oqs]
+git = "https://github.com/thomwiggers/liboqs-rust.git"
+branch = "dirty-thesis-benchmarks"
+default-features = false
+features = ["non_portable", "sigs"]

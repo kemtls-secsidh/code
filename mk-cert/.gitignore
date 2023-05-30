@@ -1,0 +1,9 @@
+*.pyc
+*.bin
+*.pub
+*.key
+*.crt
+*.lua
+*.json
+*.sig
+signutil/src/lib.rs

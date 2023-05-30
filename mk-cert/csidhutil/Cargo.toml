@@ -1,0 +1,10 @@
+[package]
+name = "csidhutil"
+version = "0.1.0"
+edition = "2018"
+
+# See more keys and their definitions at https://doc.rust-lang.org/cargo/reference/manifest.html
+
+[dependencies]
+secsidh = { path = "secsidh-rs/secsidh", optional = true}
+csidh-rust = { git = "https://github.com/thomwiggers/csidh-rust.git", branch = "ctidh", optional=true}

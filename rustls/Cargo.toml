@@ -1,0 +1,12 @@
+[workspace]
+members = [
+  # the main library and tests
+  "rustls",
+  # tests and example code that depend on mio
+  "rustls-mio",
+]
+
+[patch.crates-io]
+#webpki = { version = "0.21.9999", git = "https://github.com/thomwiggers/webpki.git", branch = "pq-take2" }
+webpki = { path = "../webpki" }
+ring = { git = "https://github.com/thomwiggers/ring.git", branch = "longer-der" }

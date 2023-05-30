@@ -1,0 +1,4 @@
+[submodule "oqs-sys/liboqs"]
+	path = oqs-sys/liboqs
+	url = https://github.com/thomwiggers/liboqs.git
+    branch = dirty-oqs-thesis-benchmarks
