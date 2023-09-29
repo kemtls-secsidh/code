@@ -21,7 +21,7 @@
 #include "../common/primes.h"
 // #include "cpucycles.h"
 
-const size_t NSAPI(pk_size) = sizeof(fp) * 2;
+const size_t NSAPI(pk_size) = sizeof(fp);
 const size_t NSAPI(sk_size) = sizeof(int8_t) * primes_num;
 const size_t NSAPI(ss_size) = sizeof(fp) * 1;
 
@@ -116,13 +116,7 @@ void secsidh_sk2oct(uint8_t *buf, const int8_t sk[primes_num])
 static inline
 void secsidh_pk2oct(uint8_t *buf, const fp *pk)
 {
-    // uint8_t test[2 * sizeof(fp)];
-    // memcpy(test, pk, 2*sizeof(fp));
-
     fp_2oct(buf, pk);
-    // fp_2oct(buf + sizeof(fp), &pk[1]);
-
-    // assert(memcmp(test, buf, sizeof(test))==0);
 }
 
 /*
@@ -158,6 +152,8 @@ void secsidh_oct2pk(fp *pk, const uint8_t *buf)
 static inline
 void secsidh_oct2sk(int8_t sk[primes_num], const uint8_t *buf)
 {
+
+
     memcpy(sk, buf, primes_num*sizeof(int8_t));
 }
 
@@ -165,9 +161,9 @@ void secsidh_oct2sk(int8_t sk[primes_num], const uint8_t *buf)
 
 int secsidh_keygen(uint8_t *pk, uint8_t *sk)
 {
-    fp ipk[2] = {0};
+    fp ipk = {0};
     int8_t isk[primes_num];
-    internal_keygen(ipk, isk);
+    internal_keygen(&ipk, isk);
 
 
     secsidh_pk2oct(pk, (const fp*)ipk);

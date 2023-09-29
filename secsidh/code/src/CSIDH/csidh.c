@@ -94,6 +94,7 @@ void fulltorsion_points(fp u, fp const a)
             continue;
         // <---
     } while ((1 - boolp) | (1 - boolm));
+    fp_dec(u, (uint64_t* const)u);    
 }
 
 int8_t action_strategy(public_key *out, fp const *in, private_key const *priv)

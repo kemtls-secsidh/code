@@ -32,6 +32,8 @@ void cofactor_multiples(proj P[], proj const A, size_t lower, size_t upper)
 }
 
 
+// #if defined(P2047m1l226) || defined(P4095m27l262) || !defined(CTIDH)
+
 #if defined(P2047m1l226) || defined(P4095m27l262)
 
 // output: true if key is valid
@@ -144,13 +146,19 @@ bool validate(public_key const *in)
     // as long as z is large enough (probabilisitically always true for our primes)
     // this verifies supersingularity, by verifying a point of order 2^z > 4 sqrt(p)
 
-    //@sopmac: are we sure this is the right amount of doubling
-    // and not one too many?
+#ifndef CTIDH
+    xmul_cofactor(&P, &P, &A);
+    ord = two_cofactor;
+#else
     while (fp_iszero(P.z) == 0 && ord < two_cofactor)
     {
         xDBL(&P, &P, &A, 1);
         ord++;
     }
+#endif
+    //@sopmac: are we sure this is the right amount of doubling
+    // and not one too many?
+
 
     // now if P is inf we not that the 2-torsion of P was ord
     if (fp_iszero(P.z) == 1 && ord > (NUMBER_OF_WORDS*64)/2 + 1)
@@ -163,4 +171,3 @@ bool validate(public_key const *in)
 }
 
 #endif
-

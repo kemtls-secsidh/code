@@ -21,13 +21,13 @@
 #include "primes.h"
 // #include "cpucycles.h"
 
-const size_t NSAPI(pk_size) = sizeof(fp) * 2;
-const size_t NSAPI(sk_size) = sizeof(int8_t) * N;
+const size_t NSAPI(pk_size) = sizeof(fp) + 16;
+const size_t NSAPI(sk_size) = PKBYTES;
 const size_t NSAPI(ss_size) = sizeof(fp) * 1;
 
 #define secsidh_keygen NSAPI(keygen)
 #define secsidh_derive NSAPI(derive)
-// #define N N
+// #define N primes_num
 
 #include "csidh_api.h"
 #include "csidh.h"
@@ -40,7 +40,7 @@ void internal_keygen(fp *pk, int8_t *sk)
 
     fp_set0(pk[0]);
     fp_set0(pk[1]);
-
+    
     // random private integer vector
     csidh_private((private_key *)sk);
 
@@ -63,6 +63,9 @@ bool internal_derive(fp *ss, fp *const pk, int8_t *const sk)
 
     if (!validate((public_key *)pk))
         return 0;   // validating the input Montgomery curve affine coefficiente (it must be supersingular!)
+
+    fp_enc(pk[1], pk[1]);
+
     int8_t error = action_strategy((public_key *)ss, (const fp *)pk, (private_key *)sk); // Secrect sharing Montgomery curve affine coefficient: [sk] * pk
 
     if(error) goto fail;
@@ -124,7 +127,18 @@ static inline void secsidh_clear(void *b, size_t s)
  */
 static inline void secsidh_sk2oct(uint8_t *buf, const int8_t sk[N])
 {
-    memcpy(buf, sk, N * sizeof(int8_t));
+    for(int i=0; i<=N; i++)
+    {
+        int8_t sum = 0;
+        for(int j = 0; j <= 7; j++)
+        {
+            if((j+i*8)>N) break;
+            sum += (!(((sk[j+i*8]) & (1<<(7)))>>7))<<j;
+        }
+        buf[i]=sum;
+    }  
+
+    // memcpy(buf, sk, N * sizeof(int8_t)); 
 }
 
 /*
@@ -135,7 +149,7 @@ static inline void secsidh_sk2oct(uint8_t *buf, const int8_t sk[N])
  */
 static inline void secsidh_pk2oct(uint8_t *buf, const fp pk[2])
 {
-    memcpy(buf, pk, 2 * sizeof(fp));
+    memcpy(buf, pk, sizeof(fp) + 16);
     // fp_2oct(buf, pk, 2);
 }
 
@@ -159,7 +173,7 @@ static inline void secsidh_ss2oct(uint8_t *buf, const fp ss[1])
  */
 static inline void secsidh_oct2pk(fp pk[2], const uint8_t *buf)
 {
-    memcpy(pk, buf, 2 * sizeof(fp));
+    memcpy(pk, buf, sizeof(fp) + 16);
     // oct2_fp(pk, buf, 2);
 }
 
@@ -171,7 +185,18 @@ static inline void secsidh_oct2pk(fp pk[2], const uint8_t *buf)
  */
 static inline void secsidh_oct2sk(int8_t sk[N], const uint8_t *buf)
 {
-    memcpy(sk, buf, N * sizeof(int8_t));
+    
+    for(int i=0; i<=N; i++)
+    {
+        for(int j = 0; j <= 7; j++)
+        {
+            if ((j+i*8)>N) break;
+            sk[j+i*8] = ((buf[i]>>j)&1);
+            sk[j+i*8] += !(sk[j+i*8]) * -1;
+        }
+    }    
+    
+    // memcpy(sk, buf, N * sizeof(int8_t));
 }
 
 // ----------------------------------- Interface between static and public API
@@ -179,7 +204,7 @@ static inline void secsidh_oct2sk(int8_t sk[N], const uint8_t *buf)
 int secsidh_keygen(uint8_t *pk, uint8_t *sk)
 {
     fp ipk[2];
-    int8_t isk[N];
+    int8_t isk[primes_num];
     internal_keygen(ipk, isk);
 
     secsidh_pk2oct(pk, (const fp *)ipk);
@@ -193,7 +218,7 @@ int secsidh_derive(uint8_t *ss, const uint8_t *peer_pk, const uint8_t *sk)
 {
     int ret;
     fp ipeer_pk[2] = {0}, iss[1];
-    int8_t isk[N];
+    int8_t isk[primes_num];
 
     secsidh_oct2pk(ipeer_pk, peer_pk);
 
