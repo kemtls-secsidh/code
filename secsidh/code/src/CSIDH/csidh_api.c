@@ -22,7 +22,7 @@
 // #include "cpucycles.h"
 
 const size_t NSAPI(pk_size) = sizeof(fp) + 16;
-const size_t NSAPI(sk_size) = PKBYTES;
+const size_t NSAPI(sk_size) = SKBITS;
 const size_t NSAPI(ss_size) = sizeof(fp) * 1;
 
 #define secsidh_keygen NSAPI(keygen)
