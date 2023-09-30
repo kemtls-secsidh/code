@@ -15,7 +15,7 @@
 #define UPPER_BOUND 1044	// Bits of 4 * sqrt( [p + 1] / [2^e] )
 #define ELLIGATOR_SEED 2
 #define N 221
-#define SKBITS 28
+#define SKBYTES 28
 #define NUMBER_OF_POINTS 12
 
 #elif defined P4095m27l262
@@ -28,7 +28,7 @@
 #define UPPER_BOUND 1240
 #define ELLIGATOR_SEED 2
 #define N 256
-#define SKBITS 32
+#define SKBYTES 32
 #define NUMBER_OF_POINTS 12
 
 #elif defined P5119m46l244
@@ -41,7 +41,7 @@
 #define UPPER_BOUND 1139
 #define ELLIGATOR_SEED 2
 #define N 234
-#define SKBITS 30
+#define SKBYTES 30
 #define NUMBER_OF_POINTS 13
 
 #elif defined P6143m59l262
@@ -54,7 +54,7 @@
 #define UPPER_BOUND 1249
 #define ELLIGATOR_SEED 3
 #define N 256
-#define SKBITS 32
+#define SKBYTES 32
 #define NUMBER_OF_POINTS 12
 
 #elif defined P8191m78l338
@@ -67,7 +67,7 @@
 #define UPPER_BOUND 1983
 #define ELLIGATOR_SEED 2
 #define N 332
-#define SKBITS 42
+#define SKBYTES 42
 #define NUMBER_OF_POINTS 13
 
 #elif defined P9215m85l389
@@ -80,7 +80,7 @@
 #define UPPER_BOUND 1983
 #define ELLIGATOR_SEED 3
 #define N 384
-#define SKBITS 48
+#define SKBYTES 48
 #define NUMBER_OF_POINTS 13
 
 #else
