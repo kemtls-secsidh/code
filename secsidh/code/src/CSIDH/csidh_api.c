@@ -127,7 +127,7 @@ static inline void secsidh_clear(void *b, size_t s)
  */
 static inline void secsidh_sk2oct(uint8_t *buf, const int8_t sk[N])
 {
-    for(int i=0; i<=N; i++)
+    for(int i=0; i<SKBYTES; i++)
     {
         int8_t sum = 0;
         for(int j = 0; j <= 7; j++)
@@ -137,8 +137,6 @@ static inline void secsidh_sk2oct(uint8_t *buf, const int8_t sk[N])
         }
         buf[i]=sum;
     }  
-
-    // memcpy(buf, sk, N * sizeof(int8_t)); 
 }
 
 /*
