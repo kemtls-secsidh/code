@@ -184,7 +184,7 @@ static inline void secsidh_oct2pk(fp pk[2], const uint8_t *buf)
 static inline void secsidh_oct2sk(int8_t sk[N], const uint8_t *buf)
 {
     
-    for(int i=0; i<=SKBYTES; i++)
+    for(int i=0; i<SKBYTES; i++)
     {
         for(int j = 0; j <= 7; j++)
         {
