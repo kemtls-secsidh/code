@@ -1,0 +1,3 @@
+[submodule "secsidh"]
+	path = secsidh
+	url = https://github.com/kemtls-secsidh/secsidh.git

@@ -1,4 +1,10 @@
-# On the Practicality of Post-Quantum TLS Using Large-Parameter CSIDH
+# Optimizations and Practicality of High-Security CSIDH
 
-This repository contains auxiliary material for the paper: "On the Practicality of Post-Quantum TLS Using Large-Parameter CSIDH".
+
+This repository contains auxiliary material for the paper: "Optimizations and Practicality of High-Security CSIDH".
+
+
+https://eprint.iacr.org/2023/793
+
+
 
